@@ -7,10 +7,9 @@ from google import genai
 
 
 GEMINI_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-4-argon",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
 ]
 
 _last_working_model = None
@@ -26,8 +25,8 @@ def get_gemini_client():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise GeminiError(
-            "GEMINI_API_KEY is not set. Set it in your terminal, "
-            "then restart the app."
+            "GEMINI_API_KEY is not set. Add it to your Render Environment "
+            "Variables or terminal, then restart the app."
         )
 
     try:
