@@ -1,174 +1,209 @@
-"""Gemini-powered correction, English master notes, and translation."""
+"""Gemini API helper functions for NoteScribe with multi-model fallback."""
+
+from __future__ import annotations
 
 import os
-from functools import lru_cache
+import streamlit as st
 
-from google import genai
-
-
-GEMINI_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-4-argon",
-]
-
-_last_working_model = None
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
 
 class GeminiError(Exception):
-    """Raised when a Gemini request cannot be completed."""
+    """Raised when a Gemini API request cannot be completed."""
 
 
-@lru_cache(maxsize=1)
-def get_gemini_client():
-    """Create and cache a Gemini client."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise GeminiError(
-            "GEMINI_API_KEY is not set. Set it in your terminal, "
-            "then restart the app."
-        )
+# Primary models tried in order (fastest first, then stronger/latest aliases)
+MODELS: tuple[str, ...] = (
+    "gemini-3.8-flash",
+    "gemini-3.1-pro-preview",
+    "gemini-flash-latest",
+    "gemini-pro-latest",
+)
+
+
+def _get_api_key() -> str:
+    """Read GEMINI_API_KEY from environment variables or .streamlit/secrets.toml."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if api_key:
+        return api_key
 
     try:
-        return genai.Client(api_key=api_key)
-    except Exception as error:
-        raise GeminiError(f"Could not initialize Gemini: {error}") from error
+        secret_key = st.secrets.get("GEMINI_API_KEY", "")
+        if isinstance(secret_key, str) and secret_key.strip():
+            return secret_key.strip()
+    except Exception:
+        pass
 
-
-def _can_try_another_model(error: Exception) -> bool:
-    """Return whether a different model might handle this error."""
-    message = str(error).upper()
-
-    if any(term in message for term in ("NO CREDITS", "BILLING", "API_KEY_INVALID")):
-        return False
-
-    return any(
-        term in message
-        for term in (
-            "503",
-            "UNAVAILABLE",
-            "429",
-            "RESOURCE_EXHAUSTED",
-            "404",
-            "NOT_FOUND",
-            "MODEL",
-        )
+    raise GeminiError(
+        "GEMINI_API_KEY is not set. Add it to your environment variables or "
+        ".streamlit/secrets.toml, then restart the app."
     )
 
 
-def _generate(prompt: str) -> str:
-    """Generate text, automatically falling back to another Gemini model."""
-    global _last_working_model
+def _discover_fallback_models(client, already_tried: set[str]) -> list[str]:
+    """Query the API for any other available Gemini text-generation models."""
+    discovered: list[str] = []
+    excluded_keywords = ("embedding", "imagen", "veo", "tts", "audio", "robotics")
 
-    client = get_gemini_client()
-    models_to_try = GEMINI_MODELS.copy()
+    try:
+        for model in client.models.list():
+            raw_name = getattr(model, "name", "") or ""
+            short_name = raw_name.replace("models/", "").strip()
+            actions = getattr(model, "supported_actions", None) or []
 
-    if _last_working_model in models_to_try:
-        models_to_try.remove(_last_working_model)
-        models_to_try.insert(0, _last_working_model)
-
-    errors = []
-
-    for model in models_to_try:
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-            )
-            result = (response.text or "").strip()
-
-            if not result:
-                errors.append(f"{model}: empty response")
+            if not short_name or short_name in already_tried:
+                continue
+            if "gemini" not in short_name.lower():
+                continue
+            if any(word in short_name.lower() for word in excluded_keywords):
+                continue
+            if actions and "generateContent" not in actions:
                 continue
 
-            _last_working_model = model
+            discovered.append(short_name)
+    except Exception:
+        return []
+
+    # Prefer flash models first for speed, then pro models
+    discovered.sort(key=lambda name: ("flash" not in name.lower(), name))
+    return discovered[:5]
+
+
+def _generate_text(prompt: str) -> str:
+    """Call Gemini across multiple models until one succeeds."""
+    if genai is None:
+        raise GeminiError(
+            "The 'google-genai' package is not installed. Run: pip install google-genai"
+        )
+
+    api_key = _get_api_key()
+    client = genai.Client(api_key=api_key)
+
+    errors: list[str] = []
+    tried: set[str] = set()
+
+    def try_models(model_list: list[str] | tuple[str, ...]) -> str | None:
+        for model_name in model_list:
+            if model_name in tried:
+                continue
+            tried.add(model_name)
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                text = (getattr(response, "text", None) or "").strip()
+                if text:
+                    return text
+                errors.append(f"{model_name}: Returned an empty response.")
+            except Exception as exc:
+                errors.append(f"{model_name}: {exc}")
+        return None
+
+    # 1. Try configured multi-model list
+    result = try_models(MODELS)
+    if result:
+        return result
+
+    # 2. Auto-discover other active Gemini models on this API key
+    dynamic_models = _discover_fallback_models(client, tried)
+    if dynamic_models:
+        result = try_models(dynamic_models)
+        if result:
             return result
 
-        except Exception as error:
-            if not _can_try_another_model(error):
-                raise GeminiError(f"Gemini request failed: {error}") from error
-            errors.append(f"{model}: {error}")
-
-    details = "\n".join(errors)
     raise GeminiError(
         "None of the configured Gemini models could complete the request. "
-        "Check your API key, quota, and model availability.\n"
-        f"{details}"
+        "Check your API key, quota, and model availability: "
+        + " | ".join(errors)
     )
 
 
-def correct_grammar(text: str) -> str:
-    """Correct OCR text and format clearly identified math as LaTeX."""
-    if not text.strip():
-        raise GeminiError("There is no transcription to correct.")
+def process_and_generate_master_note(raw_transcription: str) -> tuple[str, str]:
+    """Correct OCR text and generate a structured English master note."""
+    cleaned_input = (raw_transcription or "").strip()
+    if not cleaned_input:
+        raise GeminiError("Cannot generate a master note from empty OCR text.")
 
-    prompt = f"""
-Correct grammar, spelling, punctuation, and obvious OCR errors in these notes.
-Pay special attention to mathematical formulas and fractions.
+    prompt = f"""You are an expert academic note editor.
+You are given raw OCR text extracted from handwritten student notes.
+
+Perform two tasks:
+1. Produce a clean, corrected version of the OCR transcription (fix spelling, broken words, and misread symbols without inventing unrelated content).
+2. Produce a well-structured English Master Note using clean Markdown:
+   - Use `#`, `##`, and `###` headings
+   - Use `- ` bullet points and `**bold**` key terms
+   - Format mathematical formulas using standard LaTeX (`$...$` for inline and `$$...$$` for display equations)
+
+Return your response in this exact format with both markers included:
+
+<<<CORRECTED_TRANSCRIPTION>>>
+(put corrected transcription here)
+
+<<<MASTER_NOTE>>>
+(put structured English master note here)
+
+Raw OCR Text:
+{cleaned_input}
+"""
+
+    output = _generate_text(prompt)
+
+    corrected_marker = "<<<CORRECTED_TRANSCRIPTION>>>"
+    master_marker = "<<<MASTER_NOTE>>>"
+
+    if corrected_marker in output and master_marker in output:
+        _, remainder = output.split(corrected_marker, 1)
+        corrected_part, master_part = remainder.split(master_marker, 1)
+        return corrected_part.strip(), master_part.strip()
+
+    return cleaned_input, output
+
+
+def generate_study_questions(
+    notes_text: str,
+    num_short: int = 4,
+    num_long: int = 2,
+) -> str:
+    """Generate short and long conceptual revision questions from notes."""
+    cleaned_notes = (notes_text or "").strip()
+    if not cleaned_notes:
+        raise GeminiError("Please provide notes or a topic to generate questions.")
+
+    prompt = f"""You are an expert exam coach and subject-matter tutor.
+Based on the study notes below, generate conceptual revision questions that test real understanding rather than rote memorization.
+
+Requirements:
+- Section 1: `## Short Conceptual Questions` — Generate exactly {num_short} short-answer questions (2–3 marks each) with a brief 1–2 line key concept hint under each.
+- Section 2: `## Long Conceptual Questions` — Generate exactly {num_long} long-answer/analytical questions (5–8 marks each) with bulleted key points to cover in the answer.
+- Use clean Markdown (`##`, `###`, `- `, `**bold**`) and standard LaTeX (`$...$` / `$$...$$`) for any equations.
+
+Study Notes:
+{cleaned_notes}
+"""
+
+    return _generate_text(prompt)
+
+
+def translate_notes(master_note: str, target_language: str) -> str:
+    """Translate the master note into the selected language while preserving formatting."""
+    cleaned_note = (master_note or "").strip()
+    if not cleaned_note:
+        raise GeminiError("No master note available to translate.")
+
+    prompt = f"""Translate the following academic study notes into natural, accurate {target_language}.
 
 Rules:
-- Preserve the source meaning, values, variables, and operations.
-- Correct a mathematical symbol only when the surrounding text makes it clear.
-- Do not solve equations or invent missing values.
-- Write fractions in LaTeX using \\frac{{numerator}}{{denominator}}.
-- Put inline formulas between single dollar signs, like $\\frac{{x+1}}{{2}}$.
-- Put standalone formulas between double dollar signs on separate lines, like:
-$$
-\\frac{{x+1}}{{2}} = 4
-$$
-- If a formula is unclear, preserve what was recognized rather than guessing.
-- Return only the corrected notes.
+- Preserve all Markdown headings (`#`, `##`, `###`), bullet points (`- `), and `**bold**` formatting.
+- Keep all LaTeX mathematical expressions (`$...$` and `$$...$$`) completely unchanged.
+- Keep standard technical acronyms (e.g., LED, BLDC, HVAC, DC, AC) intact alongside the translation where appropriate.
+- Output only the translated notes with no extra commentary.
 
-NOTES:
-{text}
+Master Note:
+{cleaned_note}
 """
-    return _generate(prompt)
 
-
-def generate_master_note(text: str) -> str:
-    """Generate one concise master note in English."""
-    if not text.strip():
-        raise GeminiError("There are no notes to summarize.")
-
-    prompt = f"""
-Create one concise master note from the source text in English.
-
-Rules:
-- Write the master note in English only.
-- Capture the main ideas and important details.
-- Use headings and bullet points where helpful.
-- Preserve mathematical formulas, symbols, and values.
-- Write fractions using LaTeX \\frac{{numerator}}{{denominator}}.
-- Put inline formulas between single dollar signs, such as $\\frac{{x+1}}{{2}}$.
-- Put standalone equations between double dollar signs on separate lines.
-- Do not solve formulas or invent missing values.
-- Do not add facts that are not in the source.
-- Return only the English master note.
-
-SOURCE:
-{text}
-"""
-    return _generate(prompt)
-
-
-def translate_notes(text: str, language: str) -> str:
-    """Translate notes into the selected language."""
-    if not text.strip():
-        raise GeminiError("There are no notes to translate.")
-    if not language.strip():
-        raise GeminiError("Choose a language for the notes.")
-
-    prompt = f"""
-Translate these notes into {language}.
-
-Rules:
-- Preserve the original meaning, facts, names, numbers, and structure.
-- Preserve mathematical formulas and LaTeX exactly.
-- Do not add explanations or new facts.
-- Return only the translated notes.
-
-NOTES:
-{text}
-"""
-    return _generate(prompt)
+    return _generate_text(prompt)

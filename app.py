@@ -3,6 +3,7 @@
 from io import BytesIO
 from pathlib import Path
 import html
+import importlib
 import re
 
 import fitz  # PyMuPDF
@@ -11,12 +12,24 @@ from PIL import Image
 
 from notescribe.gemini_tools import (
     GeminiError,
-    correct_grammar,
-    generate_master_note,
+    generate_study_questions,
+    process_and_generate_master_note,
     translate_notes,
 )
+from notescribe.image_processing import split_into_lines
 from notescribe.ocr import OCRError, recognize_with_easyocr
 
+
+def _load_suggest_master_terms():
+    """Optionally load suggest_master_terms if notescribe.masternotes exists."""
+    try:
+        module = importlib.import_module("notescribe.masternotes")
+        return getattr(module, "suggest_master_terms", None)
+    except Exception:
+        return None
+
+
+suggest_master_terms = _load_suggest_master_terms()
 
 LANGUAGES = ["Hindi", "Tamil", "Assamese"]
 
@@ -45,7 +58,7 @@ def render_brand_header() -> None:
           <div class="logo">✍️</div>
           <div>
             <h1>NoteScribe</h1>
-            <p>Turn handwritten pages into clear, editable notes.</p>
+            <p>Turn handwritten pages into clear, editable notes and revision questions.</p>
           </div>
           <div class="hero-tag">AI NOTE DIGITIZER</div>
         </div>
@@ -59,6 +72,7 @@ def get_uploaded_pages(uploaded_files) -> list[tuple[str, int, Image.Image]]:
     pages = []
 
     for uploaded in uploaded_files:
+        uploaded.seek(0)
         file_bytes = uploaded.getvalue()
         filename = uploaded.name.lower()
 
@@ -133,12 +147,12 @@ def _latex_to_pdf_html(source: str) -> str:
             output.append(
                 '<table class="fraction"><tbody>'
                 '<tr><td class="numerator">'
-                f'{_latex_to_pdf_html(numerator)}'
-                '</td></tr>'
+                f"{_latex_to_pdf_html(numerator)}"
+                "</td></tr>"
                 '<tr><td class="denominator">'
-                f'{_latex_to_pdf_html(denominator)}'
-                '</td></tr>'
-                '</tbody></table>'
+                f"{_latex_to_pdf_html(denominator)}"
+                "</td></tr>"
+                "</tbody></table>"
             )
             index = next_index
             continue
@@ -162,7 +176,7 @@ def _latex_to_pdf_html(source: str) -> str:
             while command_end < len(source) and source[command_end].isalpha():
                 command_end += 1
 
-            command = source[index + 1:command_end]
+            command = source[index + 1 : command_end]
             output.append(replacements.get(command, html.escape(command)))
             index = command_end
             continue
@@ -213,7 +227,7 @@ def _notes_to_pdf_html(text: str) -> str:
 
     position = 0
     for match in math_pattern.finditer(text):
-        html_parts.append(render_plain_text(text[position:match.start()]))
+        html_parts.append(render_plain_text(text[position : match.start()]))
 
         expression = match.group(0)
         is_display_math = expression.startswith("$$")
@@ -222,13 +236,9 @@ def _notes_to_pdf_html(text: str) -> str:
         rendered_formula = _latex_to_pdf_html(latex)
 
         if is_display_math:
-            html_parts.append(
-                f'<div class="display-math">{rendered_formula}</div>'
-            )
+            html_parts.append(f'<div class="display-math">{rendered_formula}</div>')
         else:
-            html_parts.append(
-                f'<span class="inline-math">{rendered_formula}</span>'
-            )
+            html_parts.append(f'<span class="inline-math">{rendered_formula}</span>')
 
         position = match.end()
 
@@ -315,160 +325,272 @@ def main() -> None:
     load_styles()
     render_brand_header()
 
-    st.markdown(
-        "<div class='section-label'>WORKSPACE</div>",
-        unsafe_allow_html=True,
-    )
-
-    uploaded_files = st.file_uploader(
-        "Choose page images or PDF files",
-        type=["png", "jpg", "jpeg", "webp", "pdf"],
-        accept_multiple_files=True,
-        help="Upload images or multi-page PDFs.",
-    )
-
+    st.session_state.setdefault("raw_ocr_text", "")
     st.session_state.setdefault("ocr_transcription", "")
     st.session_state.setdefault("master_note", "")
+    st.session_state.setdefault("study_questions", "")
     st.session_state.setdefault("translated_notes", "")
 
-    if not uploaded_files:
-        st.markdown(
-            """
-            <div class="empty-state">
-              <div class="empty-icon">📄</div>
-              <h3>Your notes, ready to be digitized</h3>
-              <p>Upload page images or PDFs to create a master note.</p>
-            </div>
-            """,
-            unsafe_allow_html=True,
+    tab_notes, tab_questions, tab_translate = st.tabs(
+        [
+            "📄 1. Digitizer & Master Note",
+            "🎯 2. Revision Questions",
+            "🌐 3. Translation",
+        ]
+    )
+
+    with tab_notes:
+        uploaded_files = st.file_uploader(
+            "Choose page images or PDF files",
+            type=["png", "jpg", "jpeg", "webp", "pdf"],
+            accept_multiple_files=True,
+            help="Upload images or multi-page PDFs.",
         )
-        return
 
-    try:
-        pages = get_uploaded_pages(uploaded_files)
-    except Exception as error:
-        st.error(f"Could not read an uploaded file: {error}")
-        return
+        if uploaded_files:
+            pages = []
+            try:
+                pages = get_uploaded_pages(uploaded_files)
+            except Exception as error:
+                st.error(f"Could not read uploaded files: {error}")
 
-    if not pages:
-        st.warning("No pages were found in the uploaded files.")
-        return
+            if pages:
+                with st.expander(f"Preview uploaded pages ({len(pages)})", expanded=True):
+                    for filename, page_number, image in pages:
+                        st.image(
+                            image,
+                            caption=f"{filename} — page {page_number}",
+                            use_container_width=True,
+                        )
 
-    with st.expander(f"Preview uploaded pages ({len(pages)})"):
-        for filename, page_number, image in pages:
-            st.image(
-                image,
-                caption=f"{filename} — page {page_number}",
+                col1, col2 = st.columns([3, 1])
+                with col2:
+                    use_segmentation = st.checkbox(
+                        "Adaptive line segmentation",
+                        value=False,
+                        help="Slice handwriting into horizontal lines before OCR.",
+                    )
+
+                with col1:
+                    run_btn = st.button(
+                        "✦ Create English master note",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if run_btn:
+                    try:
+                        page_results = []
+                        progress = st.progress(0, text="Starting OCR…")
+
+                        with st.spinner("Extracting handwritten text and formulating note…"):
+                            for index, (filename, page_number, image) in enumerate(
+                                pages, start=1
+                            ):
+                                if use_segmentation:
+                                    line_crops = split_into_lines(image)
+                                    recognized_lines = [
+                                        recognize_with_easyocr(crop)
+                                        for crop in line_crops
+                                    ]
+                                    recognized_text = "\n".join(
+                                        line.strip()
+                                        for line in recognized_lines
+                                        if line.strip()
+                                    )
+                                else:
+                                    recognized_text = recognize_with_easyocr(image)
+
+                                page_results.append(
+                                    f"--- {filename} — page {page_number} ---\n"
+                                    f"{recognized_text}"
+                                )
+                                progress.progress(
+                                    index / len(pages),
+                                    text=f"Processed page {index} of {len(pages)}",
+                                )
+
+                            raw_transcription = "\n\n".join(page_results)
+                            if not raw_transcription.strip():
+                                progress.empty()
+                                st.warning(
+                                    "EasyOCR did not find readable text on the page."
+                                )
+                            else:
+                                st.session_state["raw_ocr_text"] = raw_transcription
+                                corrected_text, master_note_text = (
+                                    process_and_generate_master_note(raw_transcription)
+                                )
+                                st.session_state["ocr_transcription"] = corrected_text
+                                st.session_state["master_note"] = master_note_text
+                                st.session_state["study_questions"] = ""
+                                st.session_state["translated_notes"] = ""
+                                progress.empty()
+                                st.rerun()
+
+                    except OCRError as error:
+                        st.error(f"OCR Error: {error}")
+                    except GeminiError as error:
+                        st.error(f"Gemini API Error: {error}")
+                    except Exception as error:
+                        st.error(f"Execution Error: {error}")
+
+        master_note = st.session_state.get("master_note", "")
+        if master_note:
+            st.markdown("---")
+            st.markdown("## 📝 Generated Master Note")
+            st.markdown(master_note)
+
+            raw_text = st.session_state.get("raw_ocr_text", "")
+            if raw_text and suggest_master_terms:
+                suggestions = suggest_master_terms(raw_text, master_note)
+                if suggestions:
+                    with st.expander(f"Review Term Corrections ({len(suggestions)})"):
+                        for ocr_term, verified_term in suggestions:
+                            st.markdown(
+                                f"- OCR: `{ocr_term}` → Suggestion: **{verified_term}**"
+                            )
+
+            st.download_button(
+                "↓ Download English master note as PDF",
+                data=make_pdf_bytes(master_note, "Master note — English"),
+                file_name="master-note-english.pdf",
+                mime="application/pdf",
                 use_container_width=True,
+                key="download_master_note",
+            )
+        elif not uploaded_files:
+            st.info("Upload page images or PDFs above to begin.")
+
+    with tab_questions:
+        st.markdown("## 🎯 Conceptual Revision & Practice Questions")
+        st.write(
+            "Generate short and long conceptual questions based on your master note or topic."
+        )
+
+        master_note = st.session_state.get("master_note", "")
+
+        if master_note:
+            st.success(
+                "✅ Ready to generate questions directly from your active Master Note."
+            )
+            active_text = master_note
+        else:
+            st.info(
+                "💡 Generate a Master Note in Tab 1 first, or paste your topic/notes below:"
+            )
+            manual_text = st.text_area(
+                "Notes / Topic Content",
+                placeholder="Paste any theoretical notes, formulas, or study topics here...",
+                height=130,
+                key="manual_questions_input",
+            )
+            active_text = manual_text.strip()
+
+        col_q1, col_q2 = st.columns(2)
+        with col_q1:
+            num_short_q = st.number_input(
+                "Number of Short Conceptual Questions",
+                min_value=1,
+                max_value=10,
+                value=4,
+                step=1,
+                key="tab_short_q",
+            )
+        with col_q2:
+            num_long_q = st.number_input(
+                "Number of Long Conceptual Questions",
+                min_value=1,
+                max_value=6,
+                value=2,
+                step=1,
+                key="tab_long_q",
             )
 
-    if st.button(
-        "✦  Create English master note",
-        type="primary",
-        use_container_width=True,
-    ):
-        try:
-            page_results = []
-            progress = st.progress(0, text="Starting OCR…")
-
-            with st.spinner("Reading pages and creating the English master note…"):
-                for index, (filename, page_number, image) in enumerate(
-                    pages,
-                    start=1,
-                ):
-                    recognized_text = recognize_with_easyocr(image)
-                    page_results.append(
-                        f"--- {filename} — page {page_number} ---\n"
-                        f"{recognized_text}"
-                    )
-                    progress.progress(
-                        index / len(pages),
-                        text=f"Read page {index} of {len(pages)}",
-                    )
-
-                raw_transcription = "\n\n".join(page_results)
-                if not raw_transcription.strip():
-                    progress.empty()
-                    st.warning(
-                        "No text was recognized. Try clearer, "
-                        "higher-resolution pages."
-                    )
-                    return
-
-                corrected_transcription = correct_grammar(raw_transcription)
-                st.session_state["ocr_transcription"] = corrected_transcription
-                st.session_state["master_note"] = generate_master_note(
-                    corrected_transcription
+        if st.button(
+            "✦ Generate Conceptual Questions",
+            type="primary",
+            use_container_width=True,
+        ):
+            if not active_text:
+                st.warning(
+                    "Please generate a Master Note in Tab 1 or enter notes above first."
                 )
-                st.session_state["translated_notes"] = ""
+            else:
+                try:
+                    with st.spinner(
+                        f"Generating {num_short_q} short and {num_long_q} long conceptual questions…"
+                    ):
+                        questions = generate_study_questions(
+                            active_text,
+                            num_short=int(num_short_q),
+                            num_long=int(num_long_q),
+                        )
+                        st.session_state["study_questions"] = questions
+                        st.rerun()
+                except GeminiError as error:
+                    st.error(f"Gemini API Error: {error}")
+                except Exception as error:
+                    st.error(f"Error: {error}")
 
-            progress.empty()
+        study_questions = st.session_state.get("study_questions", "")
+        if study_questions:
+            st.markdown("---")
+            st.markdown("### 📋 Generated Revision Questions")
+            st.markdown(study_questions)
+            st.download_button(
+                "↓ Download Revision Questions as PDF",
+                data=make_pdf_bytes(
+                    study_questions, "NoteScribe — Conceptual Questions"
+                ),
+                file_name="conceptual-questions.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="download_practice_questions",
+            )
 
-        except OCRError as error:
-            st.error(str(error))
-        except GeminiError as error:
-            st.error(f"Could not correct the OCR or create the note: {error}")
-        except Exception as error:
-            st.error(f"Could not process the pages: {error}")
+    with tab_translate:
+        st.markdown("## 🌐 Translate Master Note")
+        master_note = st.session_state.get("master_note", "")
 
-    master_note = st.session_state.get("master_note", "")
-    if master_note:
-        st.markdown("## Master note — English")
-        st.markdown(master_note)
+        if not master_note:
+            st.info("Generate a Master Note in Tab 1 first to use translation.")
+        else:
+            target_language = st.selectbox(
+                "Choose translation language",
+                LANGUAGES,
+                key="target_lang_select",
+            )
 
-        st.download_button(
-            "↓  Download English master note as PDF",
-            data=make_pdf_bytes(master_note, "Master note — English"),
-            file_name="master-note-english.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-            key="download_master_note",
-        )
+            if st.button("Translate master note", use_container_width=True):
+                try:
+                    with st.spinner(
+                        f"Translating master note into {target_language}…"
+                    ):
+                        st.session_state["translated_notes"] = translate_notes(
+                            master_note,
+                            target_language,
+                        )
+                        st.rerun()
+                except GeminiError as error:
+                    st.error(str(error))
 
-        st.markdown("## Translate master note")
+            translated_notes = st.session_state.get("translated_notes", "")
+            if translated_notes:
+                st.markdown(f"### Master note translation — {target_language}")
+                st.markdown(translated_notes)
 
-        target_language = st.selectbox(
-            "Choose translation language",
-            LANGUAGES,
-            key="target_language",
-        )
-
-        if st.button("Translate master note", use_container_width=True):
-            try:
-                with st.spinner(
-                    f"Translating master note into {target_language}…"
-                ):
-                    st.session_state["translated_notes"] = translate_notes(
-                        master_note,
-                        target_language,
-                    )
-            except GeminiError as error:
-                st.error(str(error))
-
-    translated_notes = st.session_state.get("translated_notes", "")
-    if translated_notes:
-        target_language = st.session_state.get("target_language", "Hindi")
-        st.markdown(f"### Master note translation — {target_language}")
-        st.markdown(translated_notes)
-
-        st.download_button(
-            "↓  Download translated master note as PDF",
-            data=make_pdf_bytes(
-                translated_notes,
-                f"Master note translation — {target_language}",
-            ),
-            file_name=f"master-note-{target_language.lower()}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-            key="download_translated_notes",
-        )
-
-    if st.session_state.get("ocr_transcription"):
-        st.caption(
-            f"Processed {len(pages)} page(s) with EasyOCR. "
-            "OCR text is corrected in the background and used to create "
-            "the English master note."
-        )
+                st.download_button(
+                    "↓ Download translated master note as PDF",
+                    data=make_pdf_bytes(
+                        translated_notes,
+                        f"Master note translation — {target_language}",
+                    ),
+                    file_name=f"master-note-{target_language.lower()}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="download_translated_notes",
+                )
 
 
 if __name__ == "__main__":
