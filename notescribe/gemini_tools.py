@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import os
+import time
 import streamlit as st
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 try:
     from google import genai
@@ -15,17 +22,18 @@ class GeminiError(Exception):
     """Raised when a Gemini API request cannot be completed."""
 
 
-# Primary models tried in order (fastest first, then stronger/latest aliases)
+# Active Free-Tier text models tried in order
 MODELS: tuple[str, ...] = (
     "gemini-3.8-flash",
-    "gemini-3.1-pro-preview",
-    "gemini-flash-latest",
-    "gemini-pro-latest",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-4-hydrogen",
+    "gemini-3.1-flash-lite",
 )
 
 
 def _get_api_key() -> str:
-    """Read GEMINI_API_KEY from environment variables or .streamlit/secrets.toml."""
+    """Read GEMINI_API_KEY from environment variables, .env, or .streamlit/secrets.toml."""
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if api_key:
         return api_key
@@ -38,15 +46,32 @@ def _get_api_key() -> str:
         pass
 
     raise GeminiError(
-        "GEMINI_API_KEY is not set. Add it to your environment variables or "
+        "GEMINI_API_KEY is not set. Add it to your environment variables, .env file, or "
         ".streamlit/secrets.toml, then restart the app."
     )
 
 
 def _discover_fallback_models(client, already_tried: set[str]) -> list[str]:
-    """Query the API for any other available Gemini text-generation models."""
+    """Query the API for other active text-generation Gemini models."""
     discovered: list[str] = []
-    excluded_keywords = ("embedding", "imagen", "veo", "tts", "audio", "robotics")
+    excluded_keywords = (
+        "embedding",
+        "imagen",
+        "image",
+        "banana",
+        "veo",
+        "tts",
+        "audio",
+        "robotics",
+        "live",
+        "transcribe",
+        "omni",
+        "2.0",
+        "2.5",
+        "argon",
+        "carbon",
+        "pro-preview",
+    )
 
     try:
         for model in client.models.list():
@@ -67,13 +92,20 @@ def _discover_fallback_models(client, already_tried: set[str]) -> list[str]:
     except Exception:
         return []
 
-    # Prefer flash models first for speed, then pro models
-    discovered.sort(key=lambda name: ("flash" not in name.lower(), name))
+    # Prefer newest Flash / Flash-Lite models first
+    discovered.sort(reverse=True)
+    discovered.sort(key=lambda name: "flash" not in name.lower())
     return discovered[:5]
 
 
+def _is_temporary_overload(exc: Exception) -> bool:
+    """Check if an exception is a temporary 503 high-demand error."""
+    msg = str(exc).upper()
+    return "503" in msg or "UNAVAILABLE" in msg
+
+
 def _generate_text(prompt: str) -> str:
-    """Call Gemini across multiple models until one succeeds."""
+    """Call Gemini across active text models with safe retry on temporary 503 spikes."""
     if genai is None:
         raise GeminiError(
             "The 'google-genai' package is not installed. Run: pip install google-genai"
@@ -84,10 +116,14 @@ def _generate_text(prompt: str) -> str:
 
     errors: list[str] = []
     tried: set[str] = set()
+    overloaded_models: list[str] = []
 
-    def try_models(model_list: list[str] | tuple[str, ...]) -> str | None:
+    def try_models(
+        model_list: list[str] | tuple[str, ...],
+        allow_retry: bool = False,
+    ) -> str | None:
         for model_name in model_list:
-            if model_name in tried:
+            if not allow_retry and model_name in tried:
                 continue
             tried.add(model_name)
             try:
@@ -101,17 +137,26 @@ def _generate_text(prompt: str) -> str:
                 errors.append(f"{model_name}: Returned an empty response.")
             except Exception as exc:
                 errors.append(f"{model_name}: {exc}")
+                if not allow_retry and _is_temporary_overload(exc):
+                    overloaded_models.append(model_name)
         return None
 
-    # 1. Try configured multi-model list
+    # 1. Try primary active free-tier text models
     result = try_models(MODELS)
     if result:
         return result
 
-    # 2. Auto-discover other active Gemini models on this API key
+    # 2. Try any newly discovered non-image text models
     dynamic_models = _discover_fallback_models(client, tried)
     if dynamic_models:
         result = try_models(dynamic_models)
+        if result:
+            return result
+
+    # 3. If valid models only failed due to a brief 503 spike, wait once and retry
+    if overloaded_models:
+        time.sleep(3)
+        result = try_models(overloaded_models, allow_retry=True)
         if result:
             return result
 
@@ -204,6 +249,106 @@ Rules:
 
 Master Note:
 {cleaned_note}
+"""
+
+    return _generate_text(prompt)
+
+
+def generate_group_master_note(
+    group_name: str,
+    topic: str,
+    submissions: list,
+) -> str:
+    """Merge OCR notes from multiple class/group members into one English Master Note."""
+    if not submissions:
+        raise GeminiError("No student submissions found in this room yet.")
+
+    blocks = []
+    for index, sub in enumerate(submissions, start=1):
+        blocks.append(
+            f"=== Submission #{index} (Member: {sub['member_name']}) ===\n"
+            f"{sub['extracted_text']}"
+        )
+    combined_notes = "\n\n".join(blocks)
+
+    prompt = f"""You are an expert academic note synthesizer for a class or study group.
+Class / Group: {group_name}
+Topic: {topic}
+Total Member Submissions: {len(submissions)}
+
+Below are OCR-extracted notes uploaded by different classmates covering the same lecture/topic.
+
+Tasks:
+1. Cross-verify across submissions to fix OCR errors, broken words, and misread symbols.
+2. Deduplicate overlapping points so every concept is explained clearly once without repetition.
+3. Preserve every unique definition, formula, derivation, edge case, or example captured by even a single student.
+4. If students wrote conflicting facts or values, list them briefly at the bottom under `## Needs Clarification`.
+5. Output a clean, exam-ready English Master Note using standard Markdown:
+   - Use `#`, `##`, and `###` headings
+   - Use `- ` bullet points and `**bold**` key terms
+   - Format mathematical formulas using standard LaTeX (`$...$` for inline and `$$...$$` for display equations)
+
+Classmate Notes:
+{combined_notes}
+"""
+
+    return _generate_text(prompt)
+
+
+def generate_probable_question_paper(
+    pyq_content: str,
+    subject_name: str = "",
+    total_marks: int = 70,
+    duration: str = "3 Hours",
+    difficulty: str = "Match PYQ Level",
+    include_hints: bool = True,
+    master_note_context: str = "",
+) -> str:
+    """Analyze 3–4+ PYQs and generate a probable future practice question paper."""
+    cleaned_pyqs = (pyq_content or "").strip()
+    if not cleaned_pyqs:
+        raise GeminiError("Please upload or paste at least one PYQ paper/question set first.")
+
+    hints_rule = (
+        "- Section 3: `## Quick Answer Hints & Key Formulas` — Provide concise 2–3 line "
+        "solution approaches or key formulas for each question."
+        if include_hints
+        else "- Do NOT include answers or solution hints; output only the analysis and question paper."
+    )
+
+    notes_block = ""
+    if (master_note_context or "").strip():
+        notes_block = f"""
+Optional Class Master Notes (prioritize predicting questions that align with both the PYQ patterns AND these studied topics):
+{master_note_context.strip()}
+"""
+
+    prompt = f"""You are a senior university professor and exam-paper setter.
+Analyze the Previous Year Questions (PYQs) provided below to identify:
+- Frequently repeated concepts and high-weightage topics
+- Question framing patterns (derivations, numericals, compare/contrast, short theory)
+- Typical mark distribution and internal choices (e.g., OR questions)
+
+Then create a realistic **Future Probable Practice Question Paper** for students to practice.
+Do NOT just copy-paste old questions word-for-word; create fresh, exam-probable variations, closely related numericals, and logical follow-up questions based on the PYQ trends.
+
+Paper Specifications:
+- Subject / Exam Title: {subject_name.strip() or "Auto-detect from PYQs"}
+- Maximum Marks: {total_marks}
+- Time Allowed: {duration}
+- Difficulty Target: {difficulty}
+
+Required Output Format (clean Markdown with `#`, `##`, `###`, `- `, `**bold**`, and standard LaTeX `$...$` / `$$...$$` for math):
+1. `## PYQ Trend & High-Probability Topics` — A brief bulleted summary of the 4–6 most repeated/high-probability topics spotted across the PYQs.
+2. `# Probable Practice Question Paper` — A complete, ready-to-solve paper with:
+   - Header showing Subject, Time Allowed, and Maximum Marks
+   - Properly grouped sections (e.g., Section A: Short Answer, Section B: Medium Conceptual/Numerical, Section C: Long Analytical/Derivation) whose marks add up to exactly **{total_marks} marks**
+   - Clear mark tags next to every question (e.g., **[5 Marks]**)
+{hints_rule}
+
+Previous Year Questions (PYQs):
+{cleaned_pyqs}
+{notes_block}
 """
 
     return _generate_text(prompt)

@@ -1,6 +1,7 @@
 """EasyOCR integration for NoteScribe."""
 
 from functools import lru_cache
+import threading
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -13,6 +14,7 @@ ENGINES = {
 
 # Maximum dimension (width or height) to prevent PyTorch CPU memory exhaustion
 MAX_IMAGE_DIMENSION = 1600
+_OCR_LOCK = threading.Lock()
 
 
 class OCRError(Exception):
@@ -25,7 +27,6 @@ def get_easyocr_reader():
     try:
         import easyocr
 
-        # gpu=False ensures stability on CPU-based servers
         return easyocr.Reader(["en"], gpu=False, download_enabled=True)
     except Exception as error:
         raise OCRError(f"Could not initialize EasyOCR reader: {error}") from error
@@ -35,7 +36,6 @@ def _preprocess_image(image: Image.Image) -> np.ndarray:
     """Resize large images and optimize contrast for OCR."""
     rgb_image = image.convert("RGB")
 
-    # Resize if either dimension exceeds the safety threshold
     width, height = rgb_image.size
     max_dim = max(width, height)
     if max_dim > MAX_IMAGE_DIMENSION:
@@ -43,7 +43,6 @@ def _preprocess_image(image: Image.Image) -> np.ndarray:
         new_size = (int(width * scale), int(height * scale))
         rgb_image = rgb_image.resize(new_size, Image.Resampling.LANCZOS)
 
-    # Enhance contrast to make handwritten/faint strokes legible
     try:
         rgb_image = ImageOps.autocontrast(rgb_image, cutoff=1)
     except Exception:
@@ -56,13 +55,13 @@ def recognize_with_easyocr(image: Image.Image) -> str:
     """Recognize a full page with EasyOCR safely and efficiently."""
     try:
         processed_array = _preprocess_image(image)
-        reader = get_easyocr_reader()
-
-        detections = reader.readtext(
-            processed_array,
-            detail=0,
-            paragraph=True,
-        )
+        with _OCR_LOCK:
+            reader = get_easyocr_reader()
+            detections = reader.readtext(
+                processed_array,
+                detail=0,
+                paragraph=True,
+            )
 
         extracted_lines = [text.strip() for text in detections if text.strip()]
         return "\n".join(extracted_lines)
