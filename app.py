@@ -1,5 +1,6 @@
-"""Streamlit entry point for NoteScribe (Solo + Multi-Room Wi-Fi Server + PYQ Predictor)."""
+"""Streamlit entry point for NoteScribe (Login Gate + Solo + Multi-Room Wi-Fi Server + PYQ Predictor)."""
 
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 import html
@@ -55,6 +56,16 @@ st.set_page_config(
 db.init_db()
 
 
+def _format_local_time(iso_ts: str) -> str:
+    """Format a UTC ISO timestamp into readable local time."""
+    if not iso_ts:
+        return "-"
+    try:
+        return datetime.fromisoformat(iso_ts).astimezone().strftime("%d %b, %I:%M %p")
+    except Exception:
+        return iso_ts
+
+
 def get_local_ip() -> str:
     """Detect this machine's local Wi-Fi IPv4 address."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -102,6 +113,67 @@ def render_brand_header() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def require_login() -> dict:
+    """Block dashboard access until the user signs in with a valid Login ID."""
+    auth_user = st.session_state.get("auth_user")
+    if auth_user:
+        return auth_user
+
+    url_room = st.query_params.get("room", "")
+    if isinstance(url_room, list):
+        url_room = url_room[0] if url_room else ""
+    url_room = url_room.strip().upper()
+
+    _, center_col, _ = st.columns([1, 1.4, 1])
+    with center_col:
+        st.markdown("### 🔐 Sign In to NoteScribe")
+        if url_room:
+            st.info(f"Sign in to automatically join Class Room **`{url_room}`**.")
+
+        tab_login, tab_signup = st.tabs(["Login", "Create Login ID"])
+
+        with tab_login:
+            with st.form("login_form"):
+                login_id = st.text_input(
+                    "Login ID",
+                    placeholder="e.g., 25ee014 or anuj",
+                )
+                password = st.text_input("Password", type="password")
+                if st.form_submit_button(
+                    "Sign In", type="primary", use_container_width=True
+                ):
+                    user = db.authenticate_user(login_id, password)
+                    if user:
+                        st.session_state["auth_user"] = user
+                        st.rerun()
+                    else:
+                        st.error("Invalid Login ID or password.")
+
+        with tab_signup:
+            with st.form("signup_form", clear_on_submit=True):
+                new_id = st.text_input(
+                    "Choose Login ID",
+                    placeholder="e.g., college roll number (no spaces)",
+                )
+                full_name = st.text_input(
+                    "Full Name",
+                    placeholder="e.g., Anuj Kumar",
+                )
+                new_pw = st.text_input("Password (min 6 chars)", type="password")
+                confirm_pw = st.text_input("Confirm Password", type="password")
+                if st.form_submit_button("Create Account", use_container_width=True):
+                    if new_pw != confirm_pw:
+                        st.error("Passwords do not match.")
+                    else:
+                        ok, msg = db.register_user(new_id, full_name, new_pw)
+                        if ok:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
+
+    st.stop()
 
 
 def get_uploaded_pages(uploaded_files) -> list[tuple[str, int, Image.Image]]:
@@ -449,11 +521,15 @@ def make_pdf_bytes(text: str, title: str) -> bytes:
     return buffer.getvalue()
 
 
-def _enter_room(room_code: str) -> None:
-    """Switch dashboard into a class room and sync its saved Master Note."""
+def _enter_room(room_code: str, current_user: dict | None = None) -> None:
+    """Switch dashboard into a class room, log membership, and sync Master Note."""
     code = room_code.strip().upper()
     st.session_state["active_room"] = code
     st.query_params["room"] = code
+
+    user = current_user or st.session_state.get("auth_user")
+    if user:
+        db.record_room_member(code, user)
 
     saved_master = db.get_master_note(code)
     if saved_master:
@@ -482,12 +558,23 @@ def _leave_room() -> None:
         del st.query_params["room"]
 
 
-def render_room_sidebar(base_url: str) -> None:
-    """Render Multi-Room Creation, Room Directory, Join Room, and Wi-Fi QR controls."""
+def render_room_sidebar(base_url: str, current_user: dict) -> None:
+    """Render Account Controls, Active Room QR + Joined Users Table, Multi-Room Manager, and Join."""
     active_room = st.session_state.get("active_room", "")
-    all_groups = db.list_all_groups()
+    is_admin = current_user.get("role") == "admin"
 
     with st.sidebar:
+        role_badge = " • **Admin**" if is_admin else ""
+        st.markdown(
+            f"👤 **{current_user['full_name']}** (`{current_user['login_id']}`){role_badge}"
+        )
+        if st.button("🚪 Logout", use_container_width=True):
+            st.session_state.clear()
+            if "room" in st.query_params:
+                del st.query_params["room"]
+            st.rerun()
+
+        st.divider()
         st.header("👥 Class Room Server")
         st.caption("Same Wi-Fi / Hotspot Link:")
         st.code(base_url, language=None)
@@ -495,13 +582,48 @@ def render_room_sidebar(base_url: str) -> None:
         if active_room:
             group, submissions = db.get_group_details(active_room)
             if group:
+                db.record_room_member(active_room, current_user)
+                members = db.get_room_members(active_room)
                 room_url = f"{base_url}/?room={active_room}"
                 st.success(
-                    f"**{group['topic']}** (`{active_room}`) — {len(submissions)} note(s)"
+                    f"**{group['topic']}** (`{active_room}`) — "
+                    f"{len(members)} joined • {len(submissions)} note(s)"
                 )
                 qr_png = make_qr_png(room_url)
                 if qr_png:
                     st.image(qr_png, caption="Scan on phone to join room", width=180)
+
+                # Joined Users Table directly below the QR code
+                submitted_count = sum(1 for m in members if m["notes_submitted"] > 0)
+                st.caption(
+                    f"👥 Joined Users ({len(members)} joined • {submitted_count} submitted)"
+                )
+                member_rows = []
+                for member in members:
+                    is_you = member["login_id"] == current_user["login_id"]
+                    display_name = (
+                        f"{member['full_name']} (You)"
+                        if is_you
+                        else member["full_name"]
+                    )
+                    note_count = member["notes_submitted"]
+                    status_text = f"✅ ({note_count})" if note_count > 0 else "⏳"
+                    member_rows.append(
+                        {
+                            "Name": display_name,
+                            "ID": member["login_id"],
+                            "Notes": status_text,
+                            "Role": member["role"].title(),
+                            "Joined": _format_local_time(member["joined_at"]),
+                            "Active": _format_local_time(member["last_seen_at"]),
+                        }
+                    )
+                st.dataframe(
+                    member_rows,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
                 col_ref, col_exit = st.columns(2)
                 with col_ref:
                     if st.button("🔄 Refresh", use_container_width=True):
@@ -514,6 +636,8 @@ def render_room_sidebar(base_url: str) -> None:
             qr_png = make_qr_png(base_url)
             if qr_png:
                 st.image(qr_png, caption="Scan on phone to open server", width=165)
+
+        all_groups = db.list_all_groups()
 
         st.divider()
         st.subheader("Create Room(s)")
@@ -561,7 +685,7 @@ def render_room_sidebar(base_url: str) -> None:
                     created_rooms = db.create_multiple_groups(target_class, topic_lines)
                     st.session_state["last_created_rooms"] = created_rooms
                     if created_rooms:
-                        _enter_room(created_rooms[0]["group_code"])
+                        _enter_room(created_rooms[0]["group_code"], current_user)
                         st.rerun()
 
         last_created = st.session_state.get("last_created_rooms", [])
@@ -591,34 +715,48 @@ def render_room_sidebar(base_url: str) -> None:
                         is_current = code == active_room
                         status_icon = "✅" if room["has_master"] else "📝"
                         label_prefix = "▶ " if is_current else ""
+                        btn_label = (
+                            f"{label_prefix}{room['topic']} ({code}) • "
+                            f"👤 {room['member_count']} • {status_icon} {room['submission_count']}"
+                        )
 
-                        col_open, col_del = st.columns([4, 1])
-                        with col_open:
+                        if is_admin:
+                            col_open, col_del = st.columns([4, 1])
+                            with col_open:
+                                if st.button(
+                                    btn_label,
+                                    key=f"open_room_{code}",
+                                    use_container_width=True,
+                                    type="primary" if is_current else "secondary",
+                                ):
+                                    _enter_room(code, current_user)
+                                    st.rerun()
+                            with col_del:
+                                if st.button(
+                                    "🗑️",
+                                    key=f"del_room_{code}",
+                                    help=f"Delete room {code}",
+                                    use_container_width=True,
+                                ):
+                                    db.delete_group(code)
+                                    st.session_state["last_created_rooms"] = [
+                                        r
+                                        for r in st.session_state.get(
+                                            "last_created_rooms", []
+                                        )
+                                        if r["group_code"] != code
+                                    ]
+                                    if is_current:
+                                        _leave_room()
+                                    st.rerun()
+                        else:
                             if st.button(
-                                f"{label_prefix}{room['topic']} ({code}) • {status_icon} {room['submission_count']}",
+                                btn_label,
                                 key=f"open_room_{code}",
                                 use_container_width=True,
                                 type="primary" if is_current else "secondary",
                             ):
-                                _enter_room(code)
-                                st.rerun()
-                        with col_del:
-                            if st.button(
-                                "🗑️",
-                                key=f"del_room_{code}",
-                                help=f"Delete room {code}",
-                                use_container_width=True,
-                            ):
-                                db.delete_group(code)
-                                st.session_state["last_created_rooms"] = [
-                                    r
-                                    for r in st.session_state.get(
-                                        "last_created_rooms", []
-                                    )
-                                    if r["group_code"] != code
-                                ]
-                                if is_current:
-                                    _leave_room()
+                                _enter_room(code, current_user)
                                 st.rerun()
 
         st.divider()
@@ -638,13 +776,15 @@ def render_room_sidebar(base_url: str) -> None:
             else:
                 group, _ = db.get_group_details(join_code)
                 if group:
-                    _enter_room(join_code)
+                    _enter_room(join_code, current_user)
                     st.rerun()
                 else:
                     st.error("Room code not found.")
 
 
-def render_class_room_workspace(active_room: str, base_url: str) -> None:
+def render_class_room_workspace(
+    active_room: str, base_url: str, current_user: dict
+) -> None:
     """Render collaborative multi-member upload and Master Note merge inside Tab 1."""
     group, submissions = db.get_group_details(active_room)
     if not group:
@@ -653,6 +793,8 @@ def render_class_room_workspace(active_room: str, base_url: str) -> None:
             _leave_room()
             st.rerun()
         return
+
+    members = db.get_room_members(active_room)
 
     # Auto-sync if another classmate generated or updated the room's Master Note
     saved_master = db.get_master_note(active_room)
@@ -665,18 +807,22 @@ def render_class_room_workspace(active_room: str, base_url: str) -> None:
         st.session_state["translated_notes"] = ""
 
     room_url = f"{base_url}/?room={active_room}"
-    st.info(
-        f"**Class Room:** {group['group_name']} — **{group['topic']}**  |  "
-        f"**Code:** `{active_room}`  |  **Notes Uploaded:** `{len(submissions)}`  |  "
-        f"**Join Link:** `{room_url}`"
-    )
+    col_banner, col_refresh = st.columns([5, 1])
+    with col_banner:
+        st.info(
+            f"**Class Room:** {group['group_name']} — **{group['topic']}**  |  "
+            f"**Code:** `{active_room}`  |  **Members Joined:** `{len(members)}`  |  "
+            f"**Notes Uploaded:** `{len(submissions)}`  |  "
+            f"**Join Link:** `{room_url}`"
+        )
+    with col_refresh:
+        if st.button("🔄 Refresh Room", use_container_width=True, key="btn_refresh_room_main"):
+            st.rerun()
 
     st.markdown("### 📤 Submit Your Notes to This Room")
-    member_name = st.text_input(
-        "Your Name",
-        placeholder="e.g., Anuj / Rahul / Priya",
-        key="room_member_name",
-    )
+    member_name = f"{current_user['full_name']} ({current_user['login_id']})"
+    st.caption(f"Submitting as: **{member_name}**")
+
     uploaded_files = st.file_uploader(
         "Upload your handwritten note images or PDFs",
         type=["png", "jpg", "jpeg", "webp", "pdf"],
@@ -706,9 +852,7 @@ def render_class_room_workspace(active_room: str, base_url: str) -> None:
         )
 
     if submit_btn:
-        if not member_name.strip():
-            st.warning("Please enter your name before submitting.")
-        elif not uploaded_files and not extra_text.strip():
+        if not uploaded_files and not extra_text.strip():
             st.warning("Upload at least one image/PDF or type some notes.")
         else:
             try:
@@ -728,7 +872,7 @@ def render_class_room_workspace(active_room: str, base_url: str) -> None:
                 else:
                     db.add_submission(active_room, member_name, final_text)
                     st.success(
-                        f"Saved notes from **{member_name.strip()}** to room `{active_room}`!"
+                        f"Saved notes from **{member_name}** to room `{active_room}`!"
                     )
                     st.rerun()
             except OCRError as error:
@@ -800,6 +944,9 @@ def main() -> None:
     load_styles()
     render_brand_header()
 
+    # Require Login ID before accessing any dashboard feature
+    current_user = require_login()
+
     st.session_state.setdefault("raw_ocr_text", "")
     st.session_state.setdefault("ocr_transcription", "")
     st.session_state.setdefault("master_note", "")
@@ -819,11 +966,11 @@ def main() -> None:
     if url_room and url_room != st.session_state["active_room"]:
         group, _ = db.get_group_details(url_room)
         if group:
-            _enter_room(url_room)
+            _enter_room(url_room, current_user)
 
     port = st.get_option("server.port") or 8501
     base_url = f"http://{get_local_ip()}:{port}"
-    render_room_sidebar(base_url)
+    render_room_sidebar(base_url, current_user)
 
     active_room = st.session_state.get("active_room", "")
     tab1_label = (
@@ -843,7 +990,7 @@ def main() -> None:
 
     with tab_notes:
         if active_room:
-            render_class_room_workspace(active_room, base_url)
+            render_class_room_workspace(active_room, base_url, current_user)
         else:
             uploaded_files = st.file_uploader(
                 "Choose page images or PDF files",
